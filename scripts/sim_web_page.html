@@ -157,8 +157,15 @@ function polyline(g, b, e, fl, arr, color, width, liftZ) {
 }
 
 function draw() {
-  var b = basis(), e = eyeOf(b), fl = focal();
+  // 必须先把相机目标更新到本帧位置，再算投影；否则跟随会慢一帧、出现抖动
   if (follow && state.p) { cam.target[0] = state.p[0]; cam.target[1] = state.p[1]; cam.target[2] = state.p[2]; }
+  var b = basis(), e = eyeOf(b), fl = focal();
+
+  // 每帧清空主画布：点云走离屏缓存，但轨迹/无人机/目标点必须逐帧重画，
+  // 不清屏就会把上一帧残留叠在上面形成重影
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0b0d12';
+  ctx.fillRect(0, 0, W, H);
   redrawMap();
 
   // 已飞航迹
@@ -222,23 +229,29 @@ window.addEventListener('mousemove', function (e) {
   }
   mapKey = '';
 });
-window.addEventListener('mouseup', function (e) {
-  if (!drag) return;
-  var moved = drag.moved, right = drag.right; drag = null;
-  if (moved > 4 || right) return;                 // 拖动过就不发点
-  var r = cv.getBoundingClientRect();
-  var px = e.clientX - r.left, py = e.clientY - r.top;
+// 把画布像素反投影成世界坐标：以相机为起点做射线，与 z=目标高度 平面求交
+function goalFromPixel(px, py, planeZ) {
   var b = basis(), ey = eyeOf(b), fl = focal();
   var dir = norm([
     b.f[0] + b.r[0]*((px - W/2)/fl) + b.u[0]*((H/2 - py)/fl),
     b.f[1] + b.r[1]*((px - W/2)/fl) + b.u[1]*((H/2 - py)/fl),
     b.f[2] + b.r[2]*((px - W/2)/fl) + b.u[2]*((H/2 - py)/fl)
   ]);
+  if (Math.abs(dir[2]) < 1e-4) return null;
+  var t = (planeZ - ey[2]) / dir[2];
+  if (t <= 0) return null;
+  return [ey[0] + dir[0]*t, ey[1] + dir[1]*t, planeZ];
+}
+
+window.addEventListener('mouseup', function (e) {
+  if (!drag) return;
+  var moved = drag.moved, right = drag.right; drag = null;
+  if (moved > 4 || right) return;                 // 拖动过就不发点
+  var r = cv.getBoundingClientRect();
   var z = parseFloat(document.getElementById('gz').value) || 1.0;
-  if (Math.abs(dir[2]) < 1e-4) return;
-  var t = (z - ey[2]) / dir[2];
-  if (t <= 0) return;
-  fetch('/goal?x=' + (ey[0]+dir[0]*t).toFixed(2) + '&y=' + (ey[1]+dir[1]*t).toFixed(2) + '&z=' + z,
+  var g = goalFromPixel(e.clientX - r.left, e.clientY - r.top, z);
+  if (!g) return;
+  fetch('/goal?x=' + g[0].toFixed(2) + '&y=' + g[1].toFixed(2) + '&z=' + g[2],
         {cache: 'no-store'}).catch(function () {});
 });
 cv.addEventListener('wheel', function (e) {
