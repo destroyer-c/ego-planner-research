@@ -101,3 +101,6 @@ files/
 src/CMakeLists.txt
 .vscode/settings.json
 *.bag
+
+# 本地依赖（conda ROS 环境等），放在工作区内以免沙箱重建被清除
+.deps/

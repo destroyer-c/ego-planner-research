@@ -47,20 +47,38 @@ src/
 ## 运行与预览
 
 ### 本地 ROS 环境（conda / RoboStack，已装好）
-不用系统 apt 装 ROS，全部走 conda，环境在 `/workspace/.rosenv`：
+不用系统 apt 装 ROS，全部走 conda，环境在 `/workspace/projects/.deps/rosenv`：
 
 ```bash
-source /workspace/ros-env.sh      # 激活 ROS Noetic 环境 + source devel/setup.bash
+source /workspace/projects/.deps/ros-env.sh   # 激活 ROS Noetic 环境 + source devel/setup.bash
 ```
-- micromamba：`/workspace/.tools/micromamba`；包缓存与 root prefix：`/workspace/.mamba`
+- 依赖全部落在工作区内的 **`.deps/`**，**已被 `.gitignore` 忽略**（不进仓库）。
+  放这里是为了沙箱重建时不被清除——`/workspace` 下项目外的目录曾整体丢失过：
+  - conda 环境：`.deps/rosenv`（ROS Noetic + compilers/cmake/armadillo，约 5.4 G）
+  - micromamba：`.deps/micromamba`；`MAMBA_ROOT_PREFIX`：`.deps/mamba-root`（缓存，可丢）
+  - 激活脚本：`.deps/ros-env.sh`
 - ROS 发行版：Noetic（`ROS_DISTRO=noetic`），编辑器为 conda-forge GCC 15.3
 - 已显式降级 `empy` 到 **3.3.4**（ROS1 消息生成不兼容 empy 4.x，会报
   `module 'em' has no attribute 'RAW_OPT'`）
-- 手动激活等价写法：`eval "$(/workspace/.tools/micromamba shell hook -s bash)"; micromamba activate /workspace/.rosenv`
+- 手动激活等价写法：
+  `export MAMBA_ROOT_PREFIX=/workspace/projects/.deps/mamba-root;`
+  `eval "$(/workspace/projects/.deps/micromamba shell hook -s bash)";`
+  `micromamba activate /workspace/projects/.deps/rosenv`
+- **环境丢失后的重建**：`.deps/` 若被清掉，按下面命令重装（约 10 分钟，1 G 下载）：
+  ```bash
+  .deps/micromamba create -y -p .deps/rosenv -c robostack-staging -c conda-forge \
+    ros-noetic-desktop compilers cmake make ninja pkg-config \
+    ros-noetic-cmake-modules ros-noetic-pcl-ros ros-noetic-cv-bridge \
+    ros-noetic-image-transport ros-noetic-laser-geometry ros-noetic-nodelet \
+    ros-noetic-dynamic-reconfigure ros-noetic-tf armadillo
+  .deps/micromamba install -y -p .deps/rosenv -c conda-forge 'empy=3.3.4'
+  ```
+  重建后必须 `rm -rf build devel install` 再 `catkin_make`：旧的 `devel/setup.bash`
+  指向失效的旧环境路径，会让激活后的 `PATH` 异常。
 
 ### 构建
 ```bash
-source /workspace/ros-env.sh
+source /workspace/projects/.deps/ros-env.sh
 cd /workspace/projects
 catkin_make -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ```
@@ -73,7 +91,7 @@ catkin_make -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ### 运行（本沙箱已验证可跑）
 无头仿真（不需要显示器）：
 ```bash
-source /workspace/ros-env.sh
+source /workspace/projects/.deps/ros-env.sh
 roslaunch ego_planner run_in_sim.launch
 ```
 该 launch 不带 rviz，`flight_type=1` 需要外部给目标点：
@@ -83,7 +101,7 @@ rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
 ```
 带 rviz 可视化（沙箱无 X server，用 Xvfb 跑）：
 ```bash
-source /workspace/ros-env.sh
+source /workspace/projects/.deps/ros-env.sh
 xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
 ```
 有真实图形界面时按 README 开两个终端分别跑 `rviz.launch` 与 `run_in_sim.launch` 即可。
@@ -123,10 +141,10 @@ xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
 - `catkin_make` 报 `Compatibility with CMake < 3.5 has been removed` → 忘记加
   `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`。
 - 消息生成阶段报 `module 'em' has no attribute 'RAW_OPT'` → empy 被升级到 4.x 了，
-  重新 `micromamba install -p /workspace/.rosenv -c conda-forge 'empy=3.3.4'`。
+  重新 `micromamba install -p /workspace/projects/.deps/rosenv -c conda-forge 'empy=3.3.4'`。
 - `local_sensing/package.xml` 里声明了 `svo_msgs` / `vikit_ros`，但代码和 CMake 都没用到
   （历史残留），当前不影响 catkin_make；如遇相关依赖报错可确认后忽略。
 - `local_sensing` 默认 CPU 版；启用 GPU 需改其 `CMakeLists.txt` 中 `set(ENABLE_CUDA true)`
   并同步调整 `CUDA_NVCC_FLAGS` 的 arch/code，改动前先确认本机 CUDA 版本。
-- 磁盘：conda 环境约 5.5 G（`/workspace/.rosenv`）。空间紧张时用
-  `/workspace/.tools/micromamba clean -a -y` 清包缓存（`MAMBA_ROOT_PREFIX=/workspace/.mamba`）。
+- 磁盘：conda 环境约 5.4 G（`/workspace/projects/.deps/rosenv`）。空间紧张时用
+  `/workspace/projects/.deps/micromamba clean -a -y` 清包缓存。
