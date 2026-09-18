@@ -122,13 +122,33 @@ xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
 ```
 有真实图形界面时按 README 开两个终端分别跑 `rviz.launch` 与 `run_in_sim.launch` 即可。
 
-### 预览 / 部署
-- 平台预览不可用（`preview_enable = "disabled"`）：产物是 ROS 节点 + rviz GUI，
-  预览链路只面向 web/小程序/App 类产物，不适用。`.coze` 不写 `[dev]`、不生成 `.preview`。
-- 平台部署不支持：仓库没有任何可支撑部署的入口（无 HTTP 服务、无 package.json /
-  requirements.txt 等），故 `.coze` 不写 `[deploy]`。
-- `.coze`：`project_type = ""`（ROS/C++ 桌面仿真工程，不属于已支持的 web/小程序/App/后端类型）；
-  单层结构，`[subprojects].path = ["."]`，根 `.coze` 兼子项目 `.coze`。
+### 预览
+沙箱没有显示器（`$DISPLAY` 为空），所以专门做了一条预览链路把仿真画面搬进浏览器，
+并且**是双向的**——可以在预览里点发目标点、拖拽视角：
+
+- 入口：`bash scripts/coze-preview-run.sh`（`.coze` 的 `[dev].run`）；
+  准备阶段 `bash scripts/coze-preview-build.sh`（校验 ffmpeg/Xvfb，再复用 `setup_rosenv.sh`）
+- 链路：`Xvfb :99`（1280×1024，软件 OpenGL）→ `roslaunch ego_planner run_in_sim.launch`
+  → `roslaunch ego_planner rviz.launch` → `scripts/preview_bridge.py` 监听 `0.0.0.0:5000`
+- 预览桥做两件事：
+  - 常驻一个 `ffmpeg -f x11grab` 把 Xvfb 画面抓成 MJPEG，`/frame.jpg` 供页面轮询（约 2.5 fps）
+  - `/input?...` 把浏览器里的鼠标动作用 **XTEST**（`libXtst` + ctypes，无需额外依赖）
+    回灌到 Xvfb，因此工具栏按钮、地图点选、拖拽旋转、滚轮缩放都能用
+- 用法：先点画面里 rviz 工具栏的 **2D Nav Goal**，再点地图即可发目标点
+- 端口：`expose_port = 5000`（见 `.preview`，已 gitignore）
+- **需要留意**：本项目 `project_type = ""`，按《预览能力注册表》原本不属于可预览类型；
+  是先补出这条真实可用的 HTTP 预览链路，才把 `preview_enable` 置为 `enabled` 的。
+  改动预览实现后必须重新验证：`curl -s -o /dev/null -w '%{http_code}' http://localhost:5000`
+  返回 `200`，且 `ss -lptn 'sport = :5000'` 显示 `0.0.0.0:5000`。
+- 预览相关日志写 `.deps/preview-logs/`，**不要写 `/tmp`**——平台的临时目录会被清理掉。
+
+### 部署
+平台部署不支持：仓库没有任何可支撑部署的入口（无 HTTP 服务、无 package.json /
+requirements.txt 等），故 `.coze` 不写 `[deploy]`。
+
+### `.coze`
+`project_type = ""`（ROS/C++ 桌面仿真工程，不属于已支持的 web/小程序/App/后端类型）；
+单层结构，`[subprojects].path = ["."]`，根 `.coze` 兼子项目 `.coze`。
 
 ## 兼容性改动（让 2020 年代的代码在 conda 现代工具链上编译）
 以下改动是为了在 GCC 15 / CMake 4 / PCL 1.15 / Ogre 1.12+ / 新 libstdc++ 下能编过，
@@ -162,6 +182,16 @@ xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
 - 包管理器约定：Node 侧用 `pnpm`、Python 侧用 `uv`；本仓库 C++ 侧依赖统一走 conda（不用 apt 装 ROS）。
 
 ## 常见问题和预防
+- **抓帧必须用系统 `/usr/bin/ffmpeg`**：conda 环境里的 ffmpeg **不带 x11grab**
+  （报 `Unknown input format: 'x11grab'`）。`preview_bridge.py` 会自动探测并优先选系统那份，
+  所以不要把它写死成 PATH 上的 `ffmpeg`。
+- **沙箱没有 `fuser`**：清 5000 端口残留要用 `ss -lptnH 'sport = :5000'` 取 pid 再 kill
+  （`coze-preview-run.sh` 就是这么做的），不要依赖 `fuser -k`。
+- **沙箱里没有窗口管理器**，rviz 的窗口不会占满 Xvfb 屏幕，四周会留黑边。预览桥里的
+  `WindowFitter` 会把最大的顶层窗口 `XMoveResizeWindow` 拉到整屏——这一步不能省，
+  否则预览里只能看到右下角一小块。
+- **不要把日志写进 `/tmp`**：平台的临时目录会被清理（实测写进去的日志几分钟后就没了），
+  预览日志统一放 `.deps/preview-logs/`。
 - `src/CMakeLists.txt` 是软链，若在 Windows/无 ROS 环境解压会变成断链或空文件；
   `catkin_make` 会自动重写它，报错时先确认 conda 里 `share/catkin/cmake/toplevel.cmake` 存在。
 - `catkin_make` 必须在仓库根执行，构建产物 `build/`、`devel/` 已加入 `.gitignore`，不要提交。

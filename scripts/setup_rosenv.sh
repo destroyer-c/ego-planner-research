@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # EGO-Planner 本地 ROS 环境一键安装 / 恢复
 #
-# 做三件事：
+# 做四件事：
 #   1. 在工作区内的 .deps/ 下准备好 conda(RoboStack) ROS Noetic 环境
-#      （.deps/ 被 .gitignore 忽略，不进仓库，但会跟随工作区快照保留）
-#   2. 修复 ROS1 消息生成所需的 empy 版本（必须是 3.3.x）
-#   3. 默认清掉失效的构建产物并重新 catkin_make
+#      （.deps/ 被 .gitignore 忽略，不进仓库）
+#   2. 核对环境完整性：文件缺失就就地 --force-reinstall 修复，环境没了才重新创建
+#   3. 修复 ROS1 消息生成所需的 empy 版本（必须是 3.3.x）
+#   4. 默认清掉失效的构建产物并重新 catkin_make
 #
-# 沙箱重建、.deps/ 被清理后，跑这一条命令即可恢复。
+# 三种状态都能一条命令恢复：
+#   环境完好            -> 秒过
+#   环境被清掉一部分    -> 只重装缺失的包（沙箱回收常清掉 site-packages）
+#   环境整个没了        -> 完整重建（约 10 分钟 / 1 G 下载）
 #
 # 磁盘：沙箱总容量只有 ~9.8 G，写满会让沙箱停止工作。本脚本是磁盘消耗最大的操作，
 #       因此内置了每步动手前的磁盘预检（不足直接中止）和装完后的包缓存回收。
@@ -100,8 +104,40 @@ if [ "$FORCE" = 1 ] && [ -d "$PREFIX" ]; then
   rm -rf "$PREFIX"
 fi
 
+# 沙箱回收会清掉环境里的**部分**文件（实测 `lib/python3.12/site-packages/` 整个目录被清，
+# 108321 个文件里丢了 19262 个 / 17.8%，涉及 199 个包）。只判断目录是否存在会漏掉这种
+# “半损”状态——环境看着在、命令能跑，但 empy/rospy/rospkg 全 import 不了。
+# 所以按 conda-meta 各包的 files 清单逐个核对真实文件。
+damaged_packages() { # 输出文件缺失的包名，每行一个
+  [ -x "$PREFIX/bin/python" ] || return 0
+  local py; py="$(command -v python3 || echo "$PREFIX/bin/python")"
+  "$py" - "$PREFIX" <<'PY' 2>/dev/null || true
+import json, glob, os, sys
+os.chdir(sys.argv[1])
+for f in glob.glob('conda-meta/*.json'):
+    d = json.load(open(f))
+    files = d.get('files') or []
+    if files and any(not os.path.lexists(p) for p in files):
+        print(d['name'])
+PY
+}
+
 if [ -x "$PREFIX/bin/python" ] && [ -f "$PREFIX/setup.bash" ]; then
-  echo "conda 环境已存在：$PREFIX"
+  DAMAGED="$(damaged_packages)"
+  N_DAMAGED="$(printf '%s' "$DAMAGED" | grep -c . || true)"
+  if [ "$N_DAMAGED" -gt 0 ]; then
+    step "环境有 $N_DAMAGED 个包的文件缺失（沙箱回收常清掉 site-packages），就地修复"
+    require_disk 4000 "修复环境"
+    # shellcheck disable=SC2086
+    "$MAMBA" install -y -p "$PREFIX" "${CHANNELS[@]}" --force-reinstall $DAMAGED
+    CREATED=1
+    REMAIN="$(damaged_packages | grep -c . || true)"
+    [ "$REMAIN" = 0 ] \
+      || die "修复后仍有 $REMAIN 个包文件缺失，请重装：bash scripts/setup_rosenv.sh --force"
+    echo "环境已修复且完整"
+  else
+    echo "conda 环境已存在且完整：$PREFIX"
+  fi
 else
   step "创建 conda 环境（约 10 分钟 / 1 G 下载）"
   require_disk 7000 "创建 conda 环境"
@@ -110,13 +146,25 @@ else
 fi
 
 # ---------- 3. empy 必须是 3.3.x ----------
-if "$PREFIX/bin/python" -c 'import em,sys; sys.exit(0 if em.__version__.startswith("3.") else 1)' 2>/dev/null; then
+# empy 是纯 Python 包，优先用 pip 装：比走 conda 求解快得多，也不会卡在 conda-forge
+# 分片索引上（实测 conda 那条路会长时间停在 Fetching and Parsing Packages' Shards）。
+empy_ok() { "$PREFIX/bin/python" -c 'import em,sys; sys.exit(0 if em.__version__.startswith("3.") else 1)' 2>/dev/null; }
+if empy_ok; then
   echo "empy: $("$PREFIX/bin/python" -c 'import em; print(em.__version__)')"
 else
   step "把 empy 降到 3.3.4（empy 4.x 会让 ROS1 消息生成报 RAW_OPT 错误）"
   require_disk 3000 "降级 empy"
-  "$MAMBA" install -y -p "$PREFIX" "${CHANNELS[@]}" "$EMPY_VERSION"
-  CREATED=1
+  if [ -x "$PREFIX/bin/pip" ]; then
+    "$PREFIX/bin/pip" install -q --disable-pip-version-check --root-user-action=ignore 'empy==3.3.4'
+    # pip 装的 empy 会覆盖 conda 那份，conda 的文件清单就对不上了；删掉 conda 的 empy
+    # 元数据，免得下面的完整性核对把它误判成"文件缺失"而反复触发修复。
+    rm -f "$PREFIX"/conda-meta/empy-*.json
+  else
+    "$MAMBA" install -y -p "$PREFIX" "${CHANNELS[@]}" "$EMPY_VERSION"
+    CREATED=1
+  fi
+  empy_ok || die "empy 降级失败，请检查网络后重试"
+  echo "empy: $("$PREFIX/bin/python" -c 'import em; print(em.__version__)')"
 fi
 
 # 包缓存会临时占掉与整个环境相当的空间，装完立刻回收
