@@ -123,18 +123,28 @@ xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
 有真实图形界面时按 README 开两个终端分别跑 `rviz.launch` 与 `run_in_sim.launch` 即可。
 
 ### 预览
-沙箱没有显示器（`$DISPLAY` 为空），所以专门做了一条预览链路把仿真画面搬进浏览器，
-并且**是双向的**——可以在预览里点发目标点、拖拽视角：
+沙箱没有显示器（`$DISPLAY` 为空），所以预览走**纯 Web 可视化**：不截屏、不传图像，
+只把仿真数据以 JSON 发给浏览器，由浏览器用 Canvas 做 3D 投影绘制。
 
 - 入口：`bash scripts/coze-preview-run.sh`（`.coze` 的 `[dev].run`）；
-  准备阶段 `bash scripts/coze-preview-build.sh`（校验 ffmpeg/Xvfb，再复用 `setup_rosenv.sh`）
-- 链路：`Xvfb :99`（1280×1024，软件 OpenGL）→ `roslaunch ego_planner run_in_sim.launch`
-  → `roslaunch ego_planner rviz.launch` → `scripts/preview_bridge.py` 监听 `0.0.0.0:5000`
-- 预览桥做两件事：
-  - 常驻一个 `ffmpeg -f x11grab` 把 Xvfb 画面抓成 MJPEG，`/frame.jpg` 供页面轮询（约 2.5 fps）
-  - `/input?...` 把浏览器里的鼠标动作用 **XTEST**（`libXtst` + ctypes，无需额外依赖）
-    回灌到 Xvfb，因此工具栏按钮、地图点选、拖拽旋转、滚轮缩放都能用
-- 用法：先点画面里 rviz 工具栏的 **2D Nav Goal**，再点地图即可发目标点
+  准备阶段 `bash scripts/coze-preview-build.sh`（复用 `setup_rosenv.sh`）
+- 链路：`roslaunch ego_planner run_in_sim.launch`（**无头，不含 rviz**）
+  → `scripts/sim_web_bridge.py` 监听 `0.0.0.0:5000`
+- 页面：`scripts/sim_web_page.html`，由服务端按请求读取（改页面不用重启服务）
+- 数据来源与接口：
+  | 接口 | 内容 |
+  |---|---|
+  | `/` | 页面本体 |
+  | `/state` | 位姿 / 速度 / 目标点 / B 样条控制点（约 **474 B**，页面 25Hz 轮询） |
+  | `/map` | 体素降采样后的 3D 地图点（约 24.6k 点 / 382 KB，**只拉一次**） |
+  | `/goal?x=&y=&z=` | 发布 `/move_base_simple/goal`，即"点击地面发目标点" |
+- 交互：左键拖拽旋转、右键拖拽平移、滚轮缩放、点击地面发目标点、可切换"跟随无人机"
+- 开销：服务端 **0.11 核**（对比早期 rviz+截屏方案 1.9 核，约 17 倍），每帧 474 B（对比 243 KB）
+- **`ego_planner/Bspline` 的 Python 类在本环境缺失**：RoboStack 的 catkin 没生成 Python 消息
+  （`devel/lib/python3.12/site-packages` 一直是空的，`genmsg_py` 也静默产出空文件）。
+  因此 `sim_web_bridge.py` 用 `rospy.AnyMsg` 订阅，按 `.msg` 定义直接解析原始字节。
+  消息布局（无 Header）：`int32 order | int64 traj_id | time start_time |
+  float64[] knots | geometry_msgs/Point[] pos_pts | ...`。**改 .msg 时必须同步改解析代码。**
 - 端口：`expose_port = 5000`（见 `.preview`，已 gitignore）
 - **需要留意**：本项目 `project_type = ""`，按《预览能力注册表》原本不属于可预览类型；
   是先补出这条真实可用的 HTTP 预览链路，才把 `preview_enable` 置为 `enabled` 的。
@@ -182,22 +192,23 @@ requirements.txt 等），故 `.coze` 不写 `[deploy]`。
 - 包管理器约定：Node 侧用 `pnpm`、Python 侧用 `uv`；本仓库 C++ 侧依赖统一走 conda（不用 apt 装 ROS）。
 
 ## 常见问题和预防
-- **预览卡顿先看这三个旋钮**（按收益排序）：
-  1. **帧体积**最大项：抓帧分辨率 + JPEG 质量。`coze-preview-run.sh` 里 `SCREEN_W/H`，
-     `preview_bridge.py` 的 `--quality`（q:v）。实测 1024x768：q:v5=243 KB、q:v12=120 KB、
-     q:v16=96 KB；800x600 q:v12≈77 KB。默认已调到 96 KB/帧。
-  2. **客户端必须自限速**：页面早期用 `setInterval` 固定间隔取帧，请求会叠加堆积、越用越卡；
-     现在是"上一帧到货才取下一帧"（`MIN_GAP` 80ms 兜底），链路慢时自动降帧。
-  3. **rviz 渲染帧率**：`RVIZ_FPS`（默认已从 30 降到 10），无 GPU 时 rviz 的软件渲染是最大 CPU 项
-     （实测 1.6~1.7 核），仿真本身只占 0.05 核。
-- **抓帧必须用系统 `/usr/bin/ffmpeg`**：conda 环境里的 ffmpeg **不带 x11grab**
-  （报 `Unknown input format: 'x11grab'`）。`preview_bridge.py` 会自动探测并优先选系统那份，
-  所以不要把它写死成 PATH 上的 `ffmpeg`。
+- **预览卡顿的调优方向**（当前是纯 Web 方案，服务端只占 0.11 核，通常不是瓶颈）：
+  1. **地图点数**：`sim_web_bridge.py` 的 `--max-points`（默认 26000）与 `--voxel`（默认 0.3m）。
+     点云只在页面加载时拉一次，调小可显著降低首屏体积（382 KB → 减半）。
+  2. **客户端按需请求**：页面用 40ms 间隔 + 在途标记自限速，`/state` 每帧仅 ~474 B；
+     不要改回固定间隔无节流地拉取，否则请求会堆积。
+  3. **点云投影缓存**：静态点云投影到离屏画布，只在相机参数变化时重算（`mapKey`），
+     相机动一下就要重投影 2.4 万个点，这曾是卡顿来源，别把缓存去掉。
+- **不要退回到"rviz + 截屏"方案**：早期实现是 `Xvfb + rviz + ffmpeg x11grab + XTEST 回灌`，
+  实测 rviz 软件渲染独占 **1.6~1.7 核**、每帧 **243 KB**，链路一慢就卡成幻灯片。
+  现在的纯 Web 方案是 0.11 核 + 每帧 474 B。
 - **沙箱没有 `fuser`**：清 5000 端口残留要用 `ss -lptnH 'sport = :5000'` 取 pid 再 kill
   （`coze-preview-run.sh` 就是这么做的），不要依赖 `fuser -k`。
-- **沙箱里没有窗口管理器**，rviz 的窗口不会占满 Xvfb 屏幕，四周会留黑边。预览桥里的
-  `WindowFitter` 会把最大的顶层窗口 `XMoveResizeWindow` 拉到整屏——这一步不能省，
-  否则预览里只能看到右下角一小块。
+- **`set -euo pipefail` 下端口空闲会让脚本静默退出**：`ss | grep | cut` 管道里 grep 没匹配到
+  会返回 1，赋值语句因此触发 `set -e`。清端口的赋值必须带 `|| true`（已修，别再改掉）。
+- **预览要等 ROS master 就绪**：Web 服务启动时 `rospy.init_node` 会阻塞等待 master，
+  冷启动时 roscore 起来可能要十几秒；`coze-preview-run.sh` 里轮询 `rosnode list` 就是为了
+  避免 5000 端口迟迟不监听。
 - **不要把日志写进 `/tmp`**：平台的临时目录会被清理（实测写进去的日志几分钟后就没了），
   预览日志统一放 `.deps/preview-logs/`。
 - `src/CMakeLists.txt` 是软链，若在 Windows/无 ROS 环境解压会变成断链或空文件；

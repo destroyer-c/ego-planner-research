@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EGO-Planner 仿真</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0d12;color:#c8ccd4;overflow:hidden;
+    font:13px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  #app{position:absolute;inset:0;display:flex}
+  #stage{position:relative;flex:1;min-width:0}
+  canvas{display:block;width:100%;height:100%;cursor:crosshair}
+  #side{width:212px;flex:none;background:#12151c;border-left:1px solid #222836;padding:12px;overflow:auto}
+  #side h3{margin:0 0 8px;font-size:11.5px;color:#7c86a0;font-weight:600;letter-spacing:.06em}
+  #side h3.mt{margin-top:16px}
+  .row{display:flex;justify-content:space-between;padding:2px 0;font-variant-numeric:tabular-nums}
+  .row b{color:#e8eaed;font-weight:600}
+  .tip{position:absolute;left:12px;top:12px;background:rgba(18,21,28,.88);border:1px solid #222836;
+    border-radius:6px;padding:7px 10px;font-size:12px;color:#9aa3b8;pointer-events:none}
+  .pill{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;background:#1b2230;
+    color:#7c8cf8;margin-left:6px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
+  button{width:100%;background:#1b2230;border:1px solid #2c3444;color:#c8ccd4;border-radius:5px;
+    padding:5px 8px;font-size:12px;cursor:pointer;margin-top:6px}
+  button:hover{background:#232c3d}
+  button.on{border-color:#3b5bdb;color:#aab8ff}
+  label{display:block;margin-top:10px;color:#7c86a0;font-size:11.5px}
+  input{width:100%;box-sizing:border-box;background:#0e1117;border:1px solid #2c3444;color:#e8eaed;
+    border-radius:5px;padding:4px 6px;font-size:12px;margin-top:3px}
+  .hint{color:#6b7488;font-size:11.5px;line-height:1.7;margin-top:10px}
+</style></head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div class="tip">点击地面即发目标点 · 左键拖拽旋转 · 右键拖拽平移 · 滚轮缩放<span id="st" class="pill">连接中</span></div>
+  </div>
+  <div id="side">
+    <h3>遥测</h3>
+    <div class="row"><span>X</span><b id="tx">-</b></div>
+    <div class="row"><span>Y</span><b id="ty">-</b></div>
+    <div class="row"><span>Z</span><b id="tz">-</b></div>
+    <div class="row"><span>速度</span><b id="tv">-</b></div>
+    <div class="row"><span>规划轨迹</span><b id="tt">-</b></div>
+    <label>目标高度 (m)</label>
+    <input id="gz" type="number" value="1.0" step="0.1" min="0.3">
+    <h3 class="mt">视角</h3>
+    <button id="follow" class="on">跟随无人机</button>
+    <button id="fit">适应地图</button>
+    <button id="reset">重置视角</button>
+    <h3 class="mt">图例</h3>
+    <div class="row"><span><i class="dot" style="background:#4a7a4a"></i>地图点云</span></div>
+    <div class="row"><span><i class="dot" style="background:#7c8cf8"></i>规划轨迹</span></div>
+    <div class="row"><span><i class="dot" style="background:#f5c451"></i>已飞航迹</span></div>
+    <div class="row"><span><i class="dot" style="background:#ff5a6e"></i>目标点</span></div>
+    <div class="hint">发目标点后，规划器会生成 B 样条轨迹并自主飞行。</div>
+  </div>
+</div>
+<script>
+var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+var st = document.getElementById('st');
+var W = 0, H = 0, DPR = window.devicePixelRatio || 1;
+
+var map = null;                      // {voxel, bounds, pts:[[x,y,z],...] 单位厘米}
+var mapLayer = document.createElement('canvas');
+var mapKey = '';                     // 相机没动就复用上一帧的点云投影
+var state = {p: null, v: null, goal: null, traj: []};
+var trail = [];
+var cam = {yaw: -0.9, pitch: 0.55, dist: 38, fov: 55, target: [0, 0, 1]};
+var follow = true;
+var boxX = 450, boxY = 350;
+
+function resize() {
+  var r = cv.getBoundingClientRect();
+  W = Math.max(1, r.width); H = Math.max(1, r.height);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  mapKey = '';
+}
+window.addEventListener('resize', resize);
+
+function basis() {
+  var cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  var f = [cp * Math.cos(cam.yaw), cp * Math.sin(cam.yaw), -sp];
+  var up = [0, 0, 1];
+  var r = norm(cross(f, up));
+  var u = cross(r, f);
+  return {f: f, r: r, u: u};
+}
+function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function norm(a) { var n = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0]/n, a[1]/n, a[2]/n]; }
+function focal() { return (H / 2) / Math.tan(cam.fov * Math.PI / 360); }
+function eyeOf(b) {
+  return [cam.target[0] - b.f[0]*cam.dist, cam.target[1] - b.f[1]*cam.dist, cam.target[2] - b.f[2]*cam.dist];
+}
+function project(p, b, e, fl) {
+  var vx = p[0]-e[0], vy = p[1]-e[1], vz = p[2]-e[2];
+  var cz = vx*b.f[0] + vy*b.f[1] + vz*b.f[2];
+  if (cz < 0.3) return null;
+  var cx = vx*b.r[0] + vy*b.r[1] + vz*b.r[2];
+  var cy = vx*b.u[0] + vy*b.u[1] + vz*b.u[2];
+  return [W/2 + fl*cx/cz, H/2 - fl*cy/cz, cz];
+}
+
+// 点云是静态的：相机没变就复用离屏投影结果，避免每帧重投影两万多个点
+function redrawMap() {
+  var b = basis(), e = eyeOf(b), fl = focal();
+  var key = [b.f[0], b.f[1], b.f[2], e[0], e[1], e[2], fl, W, H].map(function (v) {
+    return (typeof v === 'number') ? v.toFixed(3) : v;
+  }).join(',');
+  if (key === mapKey) { ctx.drawImage(mapLayer, 0, 0, W, H); return; }
+  mapKey = key;
+
+  mapLayer.width = Math.round(W * DPR); mapLayer.height = Math.round(H * DPR);
+  var g = mapLayer.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.clearRect(0, 0, W, H);
+
+  drawGround(g, b, e, fl);
+  if (!map || !map.pts) { ctx.drawImage(mapLayer, 0, 0, W, H); return; }
+
+  var pts = map.pts, buf = null;
+  for (var i = 0; i < pts.length; i++) {
+    var p = pts[i];
+    var s = project([p[0]/100, p[1]/100, p[2]/100], b, e, fl);
+    if (!s || s[0] < -4 || s[0] > W + 4 || s[1] < -4 || s[1] > H + 4) continue;
+    var t = Math.min(1, p[2] / 300);                       // 按高度上色，低处暗绿、高处偏黄
+    g.fillStyle = 'rgb(' + Math.round(48 + 150*t) + ',' + Math.round(92 + 90*t) + ',' + Math.round(58 + 30*t) + ')';
+    var sz = s[2] < 12 ? 2.4 : 1.6;
+    g.fillRect(s[0], s[1], sz, sz);
+  }
+  ctx.drawImage(mapLayer, 0, 0, W, H);
+}
+
+function drawGround(g, b, e, fl) {
+  var R = boxX / 2;
+  g.strokeStyle = 'rgba(120,140,180,0.16)'; g.lineWidth = 1;
+  for (var x = -R; x <= R; x += 5) {
+    seg(g, b, e, fl, [x, -R, 0], [x, R, 0]);
+    seg(g, b, e, fl, [-R, x, 0], [R, x, 0]);
+  }
+}
+function seg(g, b, e, fl, a, c) {
+  var p = project(a, b, e, fl), q = project(c, b, e, fl);
+  if (!p || !q) return;
+  g.beginPath(); g.moveTo(p[0], p[1]); g.lineTo(q[0], q[1]); g.stroke();
+}
+
+function polyline(g, b, e, fl, arr, color, width, liftZ) {
+  g.strokeStyle = color; g.lineWidth = width; g.beginPath();
+  var started = false;
+  for (var i = 0; i < arr.length; i++) {
+    var p = arr[i];
+    var s = project([p[0], p[1], (p[2] || 0) + (liftZ || 0)], b, e, fl);
+    if (!s) { started = false; continue; }
+    started ? g.lineTo(s[0], s[1]) : (g.moveTo(s[0], s[1]), started = true);
+  }
+  g.stroke();
+}
+
+function draw() {
+  var b = basis(), e = eyeOf(b), fl = focal();
+  if (follow && state.p) { cam.target[0] = state.p[0]; cam.target[1] = state.p[1]; cam.target[2] = state.p[2]; }
+  redrawMap();
+
+  // 已飞航迹
+  if (trail.length > 1) polyline(ctx, b, e, fl, trail, 'rgba(245,196,81,0.9)', 1.6, 0);
+  // 规划轨迹（B 样条控制点）
+  if (state.traj && state.traj.length > 1) polyline(ctx, b, e, fl, state.traj, '#7c8cf8', 2, 0);
+
+  // 目标点：竖线 + 地面圈
+  if (state.goal) {
+    var gl = state.goal;
+    seg(ctx, b, e, fl, [gl[0], gl[1], 0], [gl[0], gl[1], gl[2]]);
+    ctx.strokeStyle = '#ff5a6e'; ctx.lineWidth = 2;
+    seg(ctx, b, e, fl, [gl[0]-0.5, gl[1], gl[2]], [gl[0]+0.5, gl[1], gl[2]]);
+    seg(ctx, b, e, fl, [gl[0], gl[1]-0.5, gl[2]], [gl[0], gl[1]+0.5, gl[2]]);
+    var gp = project([gl[0], gl[1], gl[2]], b, e, fl);
+    if (gp) { ctx.beginPath(); ctx.arc(gp[0], gp[1], 6, 0, Math.PI*2); ctx.stroke(); }
+  }
+
+  // 无人机：位置点 + 高度垂线 + 速度方向
+  if (state.p) {
+    var p = state.p;
+    ctx.strokeStyle = 'rgba(74,217,145,0.5)'; ctx.lineWidth = 1;
+    seg(ctx, b, e, fl, [p[0], p[1], 0], [p[0], p[1], p[2]]);
+    var sp = project(p, b, e, fl);
+    if (sp) {
+      ctx.fillStyle = '#4ad991';
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], 5, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = 'rgba(74,217,145,0.35)';
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], 11, 0, Math.PI*2); ctx.stroke();
+    }
+    if (state.v && (state.v[0] || state.v[1])) {
+      var L = 1.6;
+      seg(ctx, b, e, fl, p, [p[0]+state.v[0]*L/Math.max(1e-3, Math.hypot(state.v[0], state.v[1]))*1,
+                             p[1]+state.v[1]*L/Math.max(1e-3, Math.hypot(state.v[0], state.v[1]))*1, p[2]]);
+    }
+  }
+  requestAnimationFrame(draw);
+}
+
+// ---------- 交互 ----------
+var drag = null;
+cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+cv.addEventListener('mousedown', function (e) {
+  drag = {x: e.clientX, y: e.clientY, yaw: cam.yaw, pitch: cam.pitch,
+          target: cam.target.slice(), moved: 0, right: e.button === 2};
+});
+window.addEventListener('mousemove', function (e) {
+  if (!drag) return;
+  var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.moved = Math.max(drag.moved, Math.abs(dx) + Math.abs(dy));
+  if (drag.right) {
+    var b = basis();
+    var k = cam.dist / focal();
+    cam.target[0] = drag.target[0] - (b.r[0]*dx - b.u[0]*dy) * k;
+    cam.target[1] = drag.target[1] - (b.r[1]*dx - b.u[1]*dy) * k;
+    cam.target[2] = drag.target[2] - (b.r[2]*dx - b.u[2]*dy) * k;
+    follow = false; document.getElementById('follow').classList.remove('on');
+  } else {
+    cam.yaw = drag.yaw - dx * 0.006;
+    cam.pitch = Math.max(0.05, Math.min(1.45, drag.pitch + dy * 0.005));
+  }
+  mapKey = '';
+});
+window.addEventListener('mouseup', function (e) {
+  if (!drag) return;
+  var moved = drag.moved, right = drag.right; drag = null;
+  if (moved > 4 || right) return;                 // 拖动过就不发点
+  var r = cv.getBoundingClientRect();
+  var px = e.clientX - r.left, py = e.clientY - r.top;
+  var b = basis(), ey = eyeOf(b), fl = focal();
+  var dir = norm([
+    b.f[0] + b.r[0]*((px - W/2)/fl) + b.u[0]*((H/2 - py)/fl),
+    b.f[1] + b.r[1]*((px - W/2)/fl) + b.u[1]*((H/2 - py)/fl),
+    b.f[2] + b.r[2]*((px - W/2)/fl) + b.u[2]*((H/2 - py)/fl)
+  ]);
+  var z = parseFloat(document.getElementById('gz').value) || 1.0;
+  if (Math.abs(dir[2]) < 1e-4) return;
+  var t = (z - ey[2]) / dir[2];
+  if (t <= 0) return;
+  fetch('/goal?x=' + (ey[0]+dir[0]*t).toFixed(2) + '&y=' + (ey[1]+dir[1]*t).toFixed(2) + '&z=' + z,
+        {cache: 'no-store'}).catch(function () {});
+});
+cv.addEventListener('wheel', function (e) {
+  e.preventDefault();
+  cam.dist = Math.max(4, Math.min(220, cam.dist * (e.deltaY < 0 ? 1/1.12 : 1.12)));
+  mapKey = '';
+}, {passive: false});
+
+document.getElementById('follow').onclick = function () {
+  follow = !follow; this.classList.toggle('on', follow);
+};
+document.getElementById('fit').onclick = function () {
+  if (!map || !map.bounds) return;
+  var b0 = map.bounds;
+  cam.target = [(b0[0]+b0[2])/2, (b0[1]+b0[3])/2, 1.5];
+  cam.dist = Math.max(b0[2]-b0[0], b0[3]-b0[1]) * 1.15;
+  cam.pitch = 0.95; cam.yaw = -Math.PI/2;
+  follow = false; document.getElementById('follow').classList.remove('on');
+  mapKey = '';
+};
+document.getElementById('reset').onclick = function () {
+  cam.yaw = -0.9; cam.pitch = 0.55; cam.dist = 38;
+  follow = true; document.getElementById('follow').classList.add('on');
+  mapKey = '';
+};
+
+// ---------- 拉取数据 ----------
+function status(t, ok) { st.textContent = t; st.style.color = ok ? '#4ad991' : '#ff5a6e'; }
+
+function loadMap(retry) {
+  fetch('/map', {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (m) {
+    if (!m.pts || !m.pts.length) { setTimeout(function () { loadMap(retry); }, 1500); return; }
+    map = m; mapKey = '';
+    if (!retry) { document.getElementById('fit').click(); }
+  }).catch(function () { setTimeout(function () { loadMap(retry); }, 1500); });
+}
+
+var inflight = false;
+function poll() {
+  if (inflight) return;
+  inflight = true;
+  fetch('/state', {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (s) {
+    state = s;
+    if (s.p) {
+      var last = trail[trail.length-1];
+      if (!last || Math.hypot(s.p[0]-last[0], s.p[1]-last[1]) > 0.08) {
+        trail.push(s.p.slice());
+        if (trail.length > 4000) trail.shift();
+      }
+    }
+    document.getElementById('tx').textContent = s.p ? s.p[0].toFixed(2) : '-';
+    document.getElementById('ty').textContent = s.p ? s.p[1].toFixed(2) : '-';
+    document.getElementById('tz').textContent = s.p ? s.p[2].toFixed(2) : '-';
+    document.getElementById('tv').textContent = s.v ? Math.hypot(s.v[0], s.v[1], s.v[2]).toFixed(2)+' m/s' : '-';
+    document.getElementById('tt').textContent = (s.traj && s.traj.length > 1) ? s.traj.length+' 点' : '无';
+    status('在线 ' + s.hz + ' Hz', true);
+  }).catch(function () { status('连接断开', false); })
+    .then(function () { inflight = false; });
+}
+setInterval(poll, 40);
+
+resize();
+requestAnimationFrame(draw);
+loadMap(false);
+poll();
+</script></body></html>
