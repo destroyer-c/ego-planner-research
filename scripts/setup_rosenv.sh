@@ -192,7 +192,6 @@ if [ -x "$PREFIX/bin/python" ] && [ -f "$PREFIX/setup.bash" ]; then
   else
     echo "conda 环境已存在且完整：$PREFIX"
   fi
-  backup_site_packages
 else
   step "创建 conda 环境"
   require_disk 7000 "创建 conda 环境"
@@ -229,6 +228,7 @@ else
   empy_ok || die "empy 降级失败，请检查网络后重试"
   echo "empy: $("$PREFIX/bin/python" -c 'import em; print(em.__version__)')"
 fi
+backup_site_packages
 
 # 包缓存会临时占掉与整个环境相当的空间，装完立刻回收
 if [ "$CREATED" = 1 ]; then
