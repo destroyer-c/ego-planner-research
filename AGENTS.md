@@ -191,6 +191,40 @@ requirements.txt 等），故 `.coze` 不写 `[deploy]`。
 - 保持上游仓库原貌，不做无关的重构或目录改造；需要改动时按 catkin 包结构就地修改。
 - 包管理器约定：Node 侧用 `pnpm`、Python 侧用 `uv`；本仓库 C++ 侧依赖统一走 conda（不用 apt 装 ROS）。
 
+## 沙箱为什么会「稳定丢文件」（已查明）
+
+平台的持久化方式是**周期性把项目目录打包成 tar、重启时还原**，打包时按**目录名**排除：
+
+    .git   .venv   site-packages   __pycache__   .codegraph
+
+证据：平台二进制里 `should_exclude_general_project_dir` 的排除名单紧邻 `create_tar_gz` / `_pack_once`；
+实测丢掉的那 19262 个文件 / 199 个包，**全部**落在 `lib/python3.12/site-packages/` 下，与名单完全吻合，
+而 C++ 侧的 `.so` 和 `build/`、`devel/` 一个没少。
+
+由此得出两条铁律：
+
+1. **放进工作区的任何 Python 环境，重启后必然丢 site-packages**（conda 环境、venv 都逃不掉）。
+2. **`~/.condarc`、`/root/.cache/` 等沙箱外路径一样会丢**，所有配置都必须能由脚本重建。
+
+### 应对（已内置在 `scripts/setup_rosenv.sh`）
+- 把 site-packages 压成 `.deps/py-modules.tgz`（92 M，文件名**不含**排除关键词，所以能留下）；
+  检测到 site-packages 缺失就直接解回来，**实测 3.3 秒**（对比重新下载 10~15 分钟）。
+- `.deps/mamba-root/pkgs` 包缓存通常能留下，所以环境创建**优先离线**（1~2 分钟），失败再联网。
+- micromamba 从 **conda-forge** 取（实测 ~1 MB/s）；不要用 `micro.mamba.pm`（被限速到 ~15 KB/s）。
+
+### conda 求解「卡死」的真正原因
+conda-forge 的分片仓数据（sharded repodata）在本沙箱被限速到几乎不可用，求解会长时间停在
+`Fetching and Parsing Packages' Shards`（实测 >10 分钟无进展）。必须写进 condarc 才生效：
+
+    use_sharded_repodata: false
+
+（环境变量 `CONDA_USE_SHARDED_REPODATA=false` 实测**不生效**。）关掉后整个 create 3 分钟内走完。
+
+### 唯一可靠的持久化手段
+以上都只是「降低损失 + 加快恢复」。**真正不会丢的只有远端 git**：沙箱回退时本地提交也会一起回退
+（实测 HEAD 曾从 `3d1a646` 退回 `45e71fc`），遇到就用
+`git fetch origin && git reset --hard origin/main` 还原。所以做完一段就 commit + push。
+
 ## 常见问题和预防
 - **预览卡顿的调优方向**（当前是纯 Web 方案，服务端只占 0.11 核，通常不是瓶颈）：
   1. **地图点数**：`sim_web_bridge.py` 的 `--max-points`（默认 26000）与 `--voxel`（默认 0.3m）。

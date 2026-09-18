@@ -29,6 +29,17 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEPS_DIR="$PROJECT_DIR/.deps"
+MICROMAMBA_VERSION="2.9.0"   # conda-forge 上的稳定版
+
+# conda-forge 的分片仓数据（sharded repodata）在本沙箱会被限速到几乎卡死：求解阶段会长时间
+# 停在 "Fetching and Parsing Packages' Shards" 不动（实测 >10 分钟无进展）。关掉它退回普通
+# repodata 后，整个 create 在 3 分钟内走完。
+# 注意：环境变量 CONDA_USE_SHARDED_REPODATA=false 实测**不生效**，必须写进 condarc。
+# 而 ~/.condarc 在沙箱重建后会丢，所以每次都在这里补齐。
+if ! grep -q "use_sharded_repodata" "$HOME/.condarc" 2>/dev/null; then
+  printf 'use_sharded_repodata: false\n' >> "$HOME/.condarc"
+  echo "已在 $HOME/.condarc 关闭分片仓数据（否则 conda 求解会卡死）"
+fi
 PREFIX="$DEPS_DIR/rosenv"
 MAMBA="$DEPS_DIR/micromamba"
 ENV_SCRIPT="$DEPS_DIR/ros-env.sh"
@@ -89,16 +100,56 @@ if [ ! -x "$MAMBA" ]; then
   command -v curl >/dev/null || die "需要 curl 来下载 micromamba"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/latest -o "$tmp/mm.tar.bz2" \
-    || die "micromamba 下载失败（检查网络）"
-  tar -xjf "$tmp/mm.tar.bz2" -C "$DEPS_DIR" --strip-components=1 bin/micromamba \
-    || die "micromamba 解包失败"
+  # micro.mamba.pm 在本沙箱被限速到 ~15 KB/s（7 MB 要十几分钟），而 conda-forge 的
+  # CDN 可达且快（实测 ~180 KB/s），所以优先从 conda-forge 取，失败再回退原源。
+  cf_url="https://conda.anaconda.org/conda-forge/linux-64/micromamba-${MICROMAMBA_VERSION}-0.tar.bz2"
+  if curl -fsSL --max-time 180 "$cf_url" -o "$tmp/mm.tar.bz2"; then
+    tar -xjf "$tmp/mm.tar.bz2" -C "$tmp" bin/micromamba || die "micromamba 解包失败"
+    install -m 0755 "$tmp/bin/micromamba" "$MAMBA"
+  elif curl -fsSL --max-time 300 https://micro.mamba.pm/api/micromamba/linux-64/latest -o "$tmp/mm.tar.bz2"; then
+    tar -xjf "$tmp/mm.tar.bz2" -C "$DEPS_DIR" --strip-components=1 bin/micromamba \
+      || die "micromamba 解包失败"
+  else
+    die "micromamba 下载失败（conda-forge 与 micro.mamba.pm 都不可用，检查网络）"
+  fi
   rm -rf "$tmp"; trap - EXIT
 fi
 echo "micromamba: $("$MAMBA" --version)"
 
 # ---------- 2. conda 环境 ----------
 CREATED=0
+
+# 平台的沙箱快照在打包项目时按目录名排除 `.venv` / `site-packages` / `__pycache__` / `.codegraph`，
+# 所以放在工作区里的 Python 环境，重启后必然丢掉 site-packages（实测丢 19262 个文件 / 199 个包）。
+# 对策：把 site-packages 压成一个名字里不含这些关键词的 tar 包（.deps/py-modules.tgz）——
+# 这个文件不会被排除，重启后直接解回来即可，省掉重新下载整个环境。
+PYPKG_TGZ="$DEPS_DIR/py-modules.tgz"
+
+python_dir() {  # 环境里的 lib/python3.x 目录名（-type d 排除 python3.1 -> python3.12 这类软链）
+  find "$PREFIX/lib" -maxdepth 1 -type d -name 'python3.*' 2>/dev/null \
+    | sed 's|.*/||' | sort -V | tail -1
+}
+
+site_packages_missing() {
+  local d; d="$(python_dir)"
+  [ -n "$d" ] && [ ! -d "$PREFIX/lib/$d/site-packages" ]
+}
+
+backup_site_packages() {
+  local d; d="$(python_dir)"
+  [ -n "$d" ] && [ -d "$PREFIX/lib/$d/site-packages" ] || return 0
+  [ -f "$PYPKG_TGZ" ] && [ "$PYPKG_TGZ" -nt "$PREFIX/lib/$d/site-packages" ] && return 0
+  step "备份 site-packages 到 $(basename "$PYPKG_TGZ")（下次回收后可直接还原）"
+  tar czf "$PYPKG_TGZ" -C "$PREFIX" "lib/$d/site-packages"
+  echo "备份完成：$(du -h "$PYPKG_TGZ" | cut -f1)"
+}
+
+restore_site_packages() {
+  [ -f "$PYPKG_TGZ" ] || return 1
+  site_packages_missing || return 1
+  step "从 $(basename "$PYPKG_TGZ") 还原 site-packages（无需重新下载环境）"
+  tar xzf "$PYPKG_TGZ" -C "$PREFIX"
+}
 if [ "$FORCE" = 1 ] && [ -d "$PREFIX" ]; then
   step "删除现有环境（--force）"
   rm -rf "$PREFIX"
@@ -123,6 +174,9 @@ PY
 }
 
 if [ -x "$PREFIX/bin/python" ] && [ -f "$PREFIX/setup.bash" ]; then
+  if restore_site_packages; then
+    echo "site-packages 已从本地备份还原"
+  fi
   DAMAGED="$(damaged_packages)"
   N_DAMAGED="$(printf '%s' "$DAMAGED" | grep -c . || true)"
   if [ "$N_DAMAGED" -gt 0 ]; then
@@ -138,10 +192,19 @@ if [ -x "$PREFIX/bin/python" ] && [ -f "$PREFIX/setup.bash" ]; then
   else
     echo "conda 环境已存在且完整：$PREFIX"
   fi
+  backup_site_packages
 else
-  step "创建 conda 环境（约 10 分钟 / 1 G 下载）"
+  step "创建 conda 环境"
   require_disk 7000 "创建 conda 环境"
-  "$MAMBA" create -y -p "$PREFIX" "${CHANNELS[@]}" "${PACKAGES[@]}"
+  # 包缓存（.deps/mamba-root/pkgs）通常不会被清掉，且沙箱每次回收都会清空环境，
+  # 所以优先用缓存离线创建（实测 1~2 分钟）；缓存不全时再回退联网（约 10 分钟 / 1 G）。
+  if "$MAMBA" create --offline -y -p "$PREFIX" "${CHANNELS[@]}" "${PACKAGES[@]}"; then
+    echo "已用本地包缓存离线创建完成（未联网）"
+  else
+    echo "本地包缓存不完整，回退为联网创建（约 10 分钟）"
+    rm -rf "$PREFIX"
+    "$MAMBA" create -y -p "$PREFIX" "${CHANNELS[@]}" "${PACKAGES[@]}"
+  fi
   CREATED=1
 fi
 
@@ -234,12 +297,13 @@ cat <<EOF
   cd $PROJECT_DIR
   roslaunch ego_planner run_in_sim.launch
 
-该 launch 不带 rviz，需要另发目标点触发飞行：
+该 launch 不带 rviz：在平台预览面板里点地面即可发目标点（纯 Web 3D 可视化，
+不依赖 rviz / Xvfb / 图像传输）。命令行发目标点等价写法：
 
   rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \\
     '{header: {frame_id: "world"}, pose: {position: {x: 15.0, y: 0.0, z: 1.0}, orientation: {w: 1.0}}}'
 
-要 rviz 可视化（沙箱无 X server 时）：
+预览服务由 .coze 的 [dev] 管理；手动起用：
 
-  xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
+  bash scripts/coze-preview-run.sh
 EOF
