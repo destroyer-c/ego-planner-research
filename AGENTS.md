@@ -147,6 +147,17 @@ xvfb-run -a -s "-screen 0 1280x1024x24" roslaunch ego_planner simple_run.launch
    补 `#include <OGRE/OgreTechnique.h>`（Ogre 1.12+ 不再传递包含 `Ogre::Technique`）。
 
 ## 用户偏好与长期约束
+- **严禁把磁盘写满（硬约束，最高优先级）**：沙箱磁盘总容量只有 **9.8 G**，一旦写满
+  **沙箱会直接停止工作**，未提交的内容可能丢失。必须始终留出余量：
+  - 动手前后都先 `df -h /` 看 `Avail`；**低于 2 G 就先清理**再往下做。
+  - conda 是本项目最大的磁盘消耗方：`create` / `install` 时包缓存与解压产物会让占用
+    临时翻倍（实测从 1.3 G 涨到 8.3 G）。**装完必须立刻清理包缓存**：
+    `MAMBA_ROOT_PREFIX=.deps/mamba-root .deps/micromamba clean -a -y`。
+    `scripts/setup_rosenv.sh` 已内置磁盘预检与装后自动清理，优先用它。
+  - 大体积产物用完即清：`build/`、`devel/`、conda 包缓存、`/workspace/logs/*.log`。
+  - 磁盘吃紧时不要并行跑第二份 `catkin_make`、也不要同时起多个 `roslaunch`
+    （日志与中间产物会叠加）。
+  - 后台进程一律重定向日志到文件，跑完检查有无残留并及时清掉。
 - 保持上游仓库原貌，不做无关的重构或目录改造；需要改动时按 catkin 包结构就地修改。
 - 包管理器约定：Node 侧用 `pnpm`、Python 侧用 `uv`；本仓库 C++ 侧依赖统一走 conda（不用 apt 装 ROS）。
 

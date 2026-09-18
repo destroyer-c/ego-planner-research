@@ -9,6 +9,9 @@
 #
 # 沙箱重建、.deps/ 被清理后，跑这一条命令即可恢复。
 #
+# 磁盘：沙箱总容量只有 ~9.8 G，写满会让沙箱停止工作。本脚本是磁盘消耗最大的操作，
+#       因此内置了每步动手前的磁盘预检（不足直接中止）和装完后的包缓存回收。
+#
 # 用法：
 #   bash scripts/setup_rosenv.sh              # 装环境 + 编译
 #   bash scripts/setup_rosenv.sh --no-build   # 只装环境，不编译
@@ -57,6 +60,18 @@ done
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 die()  { echo "错误：$1" >&2; exit 1; }
 
+# 沙箱磁盘总容量只有 ~9.8 G，写满会直接让沙箱停止工作。
+# conda 是本项目最大的磁盘消耗方，所以每一步动手前都先算余量。
+avail_mib() { df -Pk "$1" | awk 'NR==2 {print int($4/1024)}'; }
+require_disk() { # $1=所需 MiB  $2=要干的事
+  local have; have="$(avail_mib "$PROJECT_DIR")"
+  if [ "$have" -lt "$1" ]; then
+    die "磁盘可用仅 ${have} MiB，不足「$2」所需的 ${1} MiB。把磁盘写满会导致沙箱停止工作。
+     先清理后重试：rm -rf build devel install、\$MAMBA clean -a -y、清空 /workspace/logs/*.log"
+  fi
+  echo "磁盘可用 ${have} MiB，满足「$2」（需 ${1} MiB）"
+}
+
 # ---------- 0. 确保 .deps/ 不被 git 追踪 ----------
 mkdir -p "$DEPS_DIR"
 if ! grep -qx '\.deps/' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
@@ -89,6 +104,7 @@ if [ -x "$PREFIX/bin/python" ] && [ -f "$PREFIX/setup.bash" ]; then
   echo "conda 环境已存在：$PREFIX"
 else
   step "创建 conda 环境（约 10 分钟 / 1 G 下载）"
+  require_disk 7000 "创建 conda 环境"
   "$MAMBA" create -y -p "$PREFIX" "${CHANNELS[@]}" "${PACKAGES[@]}"
   CREATED=1
 fi
@@ -98,7 +114,17 @@ if "$PREFIX/bin/python" -c 'import em,sys; sys.exit(0 if em.__version__.startswi
   echo "empy: $("$PREFIX/bin/python" -c 'import em; print(em.__version__)')"
 else
   step "把 empy 降到 3.3.4（empy 4.x 会让 ROS1 消息生成报 RAW_OPT 错误）"
+  require_disk 3000 "降级 empy"
   "$MAMBA" install -y -p "$PREFIX" "${CHANNELS[@]}" "$EMPY_VERSION"
+  CREATED=1
+fi
+
+# 包缓存会临时占掉与整个环境相当的空间，装完立刻回收
+if [ "$CREATED" = 1 ]; then
+  step "清理 conda 包缓存"
+  before="$(avail_mib "$PROJECT_DIR")"
+  "$MAMBA" clean -a -y >/dev/null
+  echo "回收 $(($(avail_mib "$PROJECT_DIR") - before)) MiB，当前可用 $(avail_mib "$PROJECT_DIR") MiB"
 fi
 
 # ---------- 4. 激活脚本 ----------
@@ -127,6 +153,7 @@ if [ "$DO_BUILD" = 1 ]; then
 
   if [ "$CREATED" = 1 ] || [ "$STALE" = 1 ]; then
     step "清理失效构建产物并 catkin_make"
+    require_disk 2000 "catkin_make"
     # 这一步必须做：旧的 devel/setup.bash 指向已消失的旧环境，source 它会把 PATH 洗掉
     rm -rf "$PROJECT_DIR/build" "$PROJECT_DIR/devel" "$PROJECT_DIR/install"
     # shellcheck disable=SC1090
