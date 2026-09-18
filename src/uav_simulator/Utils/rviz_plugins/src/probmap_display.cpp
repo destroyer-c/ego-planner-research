@@ -31,6 +31,7 @@
 
 #include <OGRE/OgreManualObject.h>
 #include <OGRE/OgreMaterialManager.h>
+#include <OGRE/OgreTechnique.h>
 #include <OGRE/OgreSceneManager.h>
 #include <OGRE/OgreSceneNode.h>
 #include <OGRE/OgreTextureManager.h>
