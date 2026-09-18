@@ -21,6 +21,8 @@
 
 ## 目录结构
 ```
+scripts/
+└── setup_rosenv.sh         # 本地 conda ROS 环境一键安装/恢复（见「运行与预览」）
 src/
 ├── CMakeLists.txt          # catkin toplevel 软链，勿动（每次 catkin_make 会被重写）
 ├── planner/                # 规划器核心
@@ -64,7 +66,18 @@ source /workspace/projects/.deps/ros-env.sh   # 激活 ROS Noetic 环境 + sourc
   `export MAMBA_ROOT_PREFIX=/workspace/projects/.deps/mamba-root;`
   `eval "$(/workspace/projects/.deps/micromamba shell hook -s bash)";`
   `micromamba activate /workspace/projects/.deps/rosenv`
-- **环境丢失后的重建**：`.deps/` 若被清掉，按下面命令重装（约 10 分钟，1 G 下载）：
+- **沙箱重建 / `.deps/` 丢失后的一键恢复**（推荐）：
+  ```bash
+  bash scripts/setup_rosenv.sh          # 装环境 + 编译，约 10 分钟
+  bash scripts/setup_rosenv.sh --no-build   # 只装环境
+  bash scripts/setup_rosenv.sh --force      # 删掉现有环境重装
+  ```
+  脚本自包含：会按需下载 micromamba、建环境、把 `empy` 降到 3.3.4、生成 `.deps/ros-env.sh`，
+  并在检测到构建产物失效（`build/CMakeCache.txt` 不含当前环境前缀）时清掉
+  `build devel install` 再 `catkin_make`。
+  **注意**：`.deps/` 被清掉后必须重建构建产物——旧的 `devel/setup.bash` 指向失效的旧环境
+  路径，`source` 它会把 `PATH` 洗掉，导致激活后找不到 `rospack`。脚本已自动处理。
+- 手工等价步骤（脚本不可用时）：
   ```bash
   .deps/micromamba create -y -p .deps/rosenv -c robostack-staging -c conda-forge \
     ros-noetic-desktop compilers cmake make ninja pkg-config \
@@ -72,9 +85,12 @@ source /workspace/projects/.deps/ros-env.sh   # 激活 ROS Noetic 环境 + sourc
     ros-noetic-image-transport ros-noetic-laser-geometry ros-noetic-nodelet \
     ros-noetic-dynamic-reconfigure ros-noetic-tf armadillo
   .deps/micromamba install -y -p .deps/rosenv -c conda-forge 'empy=3.3.4'
+  rm -rf build devel install
   ```
-  重建后必须 `rm -rf build devel install` 再 `catkin_make`：旧的 `devel/setup.bash`
-  指向失效的旧环境路径，会让激活后的 `PATH` 异常。
+- 为什么依赖放工作区内而不是 `/workspace/.rosenv`：平台把 `build/`、`devel/`、`.codegraph`
+  这类 **`.gitignore` 但未追踪**的目录一并保留了下来，而项目外的 `/workspace/.rosenv` 在
+  重建时丢失。所以「放进 `/workspace/projects` + gitignore 忽略」既不会被清，也不必把
+  5.4 G 二进制提交进 git。
 
 ### 构建
 ```bash
