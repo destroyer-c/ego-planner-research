@@ -182,6 +182,14 @@ requirements.txt 等），故 `.coze` 不写 `[deploy]`。
 - 包管理器约定：Node 侧用 `pnpm`、Python 侧用 `uv`；本仓库 C++ 侧依赖统一走 conda（不用 apt 装 ROS）。
 
 ## 常见问题和预防
+- **预览卡顿先看这三个旋钮**（按收益排序）：
+  1. **帧体积**最大项：抓帧分辨率 + JPEG 质量。`coze-preview-run.sh` 里 `SCREEN_W/H`，
+     `preview_bridge.py` 的 `--quality`（q:v）。实测 1024x768：q:v5=243 KB、q:v12=120 KB、
+     q:v16=96 KB；800x600 q:v12≈77 KB。默认已调到 96 KB/帧。
+  2. **客户端必须自限速**：页面早期用 `setInterval` 固定间隔取帧，请求会叠加堆积、越用越卡；
+     现在是"上一帧到货才取下一帧"（`MIN_GAP` 80ms 兜底），链路慢时自动降帧。
+  3. **rviz 渲染帧率**：`RVIZ_FPS`（默认已从 30 降到 10），无 GPU 时 rviz 的软件渲染是最大 CPU 项
+     （实测 1.6~1.7 核），仿真本身只占 0.05 核。
 - **抓帧必须用系统 `/usr/bin/ffmpeg`**：conda 环境里的 ffmpeg **不带 x11grab**
   （报 `Unknown input format: 'x11grab'`）。`preview_bridge.py` 会自动探测并优先选系统那份，
   所以不要把它写死成 PATH 上的 `ffmpeg`。

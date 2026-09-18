@@ -63,13 +63,19 @@ function toScreen(ev) {
 function send(params) {
   fetch('/input?' + new URLSearchParams(params), {cache: 'no-store'}).catch(() => {});
 }
-function tick() {
-  const img = new Image();
-  img.onload = () => { v.src = img.src; fails = 0; st.textContent = '实时画面'; };
-  img.onerror = () => { fails++; st.textContent = '等待仿真画面…'; };
-  img.src = '/frame.jpg?t=' + Date.now();
+const MIN_GAP = 80;  // 最快约 12fps；再快也只是浪费带宽
+function load() {
+  v.onload = () => {
+    fails = 0; st.textContent = '实时画面';
+    setTimeout(load, MIN_GAP);
+  };
+  v.onerror = () => {
+    st.textContent = '等待仿真画面…';
+    setTimeout(load, fails++ > 20 ? 2000 : 500);
+  };
+  v.src = '/frame.jpg?t=' + Date.now();
 }
-setInterval(tick, 400); tick();
+load();
 
 v.addEventListener('contextmenu', e => e.preventDefault());
 v.addEventListener('mousedown', e => {
@@ -166,11 +172,11 @@ class WindowFitter(threading.Thread):
 class FrameGrabber:
     """常驻一个 ffmpeg 抓 X11 画面，把最新一帧 JPEG 留在内存里给 HTTP 取用。"""
 
-    def __init__(self, display, width, height, fps, ffmpeg=None):
+    def __init__(self, display, width, height, fps, quality, ffmpeg=None):
         self.cmd = [
             find_ffmpeg(ffmpeg), "-loglevel", "error", "-f", "x11grab",
             "-video_size", f"{width}x{height}", "-i", display,
-            "-r", str(fps), "-f", "mjpeg", "-q:v", "5", "-",
+            "-r", str(fps), "-f", "mjpeg", "-q:v", str(quality), "-",
         ]
         self._lock = threading.Lock()
         self._frame = None
@@ -317,14 +323,15 @@ def main():
     parser.add_argument("--display", default=":99")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--fps", type=int, default=4)
+    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--quality", type=int, default=16, help="JPEG 质量，数字越大越小越糊")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--ffmpeg", default=None, help="指定支持 x11grab 的 ffmpeg 路径")
     parser.add_argument("--no-fit-window", action="store_true", help="不把最大窗口拉到整屏")
     args = parser.parse_args()
 
-    BridgeHandler.grabber = FrameGrabber(args.display, args.width, args.height, args.fps, args.ffmpeg)
+    BridgeHandler.grabber = FrameGrabber(args.display, args.width, args.height, args.fps, args.quality, args.ffmpeg)
     if not args.no_fit_window:
         WindowFitter(args.display, args.width, args.height).start()
     BridgeHandler.pointer = Pointer(args.display, args.width, args.height)
@@ -332,8 +339,8 @@ def main():
 
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
     server.daemon_threads = True
-    print("预览桥已就绪: http://%s:%d (display=%s %dx%d @%dfps)"
-          % (args.host, args.port, args.display, args.width, args.height, args.fps), flush=True)
+    print("预览桥已就绪: http://%s:%d (display=%s %dx%d @%dfps q%d)"
+          % (args.host, args.port, args.display, args.width, args.height, args.fps, args.quality), flush=True)
     server.serve_forever()
 
 
